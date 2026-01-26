@@ -1,0 +1,3 @@
+/Users/luck/gitea/c++/linkerhand-python-sdk/linkerhand-cpp-sdk/build/CMakeFiles/linkerhand_cpp_sdk.dir
+/Users/luck/gitea/c++/linkerhand-python-sdk/linkerhand-cpp-sdk/build/CMakeFiles/edit_cache.dir
+/Users/luck/gitea/c++/linkerhand-python-sdk/linkerhand-cpp-sdk/build/CMakeFiles/rebuild_cache.dir
