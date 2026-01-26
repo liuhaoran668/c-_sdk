@@ -801,7 +801,7 @@ CMakeFiles/linkerhand_cpp_sdk.dir/src/hand/l6/l6.cpp.o: \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/forward_list \
   /Users/luck/gitea/c++/linkerhand-python-sdk/linkerhand-cpp-sdk/include/linkerhand/exceptions.hpp \
   /Users/luck/gitea/c++/linkerhand-python-sdk/linkerhand-cpp-sdk/include/linkerhand/hand/l6/angle_manager.hpp \
-  /Users/luck/gitea/c++/linkerhand-python-sdk/linkerhand-cpp-sdk/include/linkerhand/iterable_queue.hpp \
+  /Users/luck/gitea/c++/linkerhand-python-sdk/linkerhand-cpp-sdk/include/linkerhand/manager_base.hpp \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/condition_variable \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__stop_token/stop_callback.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__stop_token/intrusive_shared_ptr.h \
@@ -809,6 +809,7 @@ CMakeFiles/linkerhand_cpp_sdk.dir/src/hand/l6/l6.cpp.o: \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__stop_token/atomic_unique_lock.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__stop_token/intrusive_list_view.h \
   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1/__stop_token/stop_token.h \
+  /Users/luck/gitea/c++/linkerhand-python-sdk/linkerhand-cpp-sdk/include/linkerhand/iterable_queue.hpp \
   /Users/luck/gitea/c++/linkerhand-python-sdk/linkerhand-cpp-sdk/include/linkerhand/hand/l6/current_manager.hpp \
   /Users/luck/gitea/c++/linkerhand-python-sdk/linkerhand-cpp-sdk/include/linkerhand/hand/l6/fault_manager.hpp \
   /Users/luck/gitea/c++/linkerhand-python-sdk/linkerhand-cpp-sdk/include/linkerhand/hand/l6/force_sensor_manager.hpp \
