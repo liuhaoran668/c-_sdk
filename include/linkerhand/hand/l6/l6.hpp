@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -21,7 +22,7 @@ class L6 {
 
   CANMessageDispatcher dispatcher_;
   std::uint32_t arbitration_id_ = 0x28;
-  bool closed_ = false;
+  std::atomic<bool> closed_{false};
 
  public:
   L6(const std::string& side, const std::string& interface_name, const std::string& interface_type = "socketcan");

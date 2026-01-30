@@ -86,7 +86,18 @@ struct AngleManager::Impl {
       is_streaming = streaming_queue.has_value();
     }
     if (!is_streaming) {
-      send_sense_request();
+      try {
+        send_sense_request();
+      } catch (...) {
+        std::lock_guard<std::mutex> lock(waiters_mutex);
+        waiters.erase(
+            std::remove_if(
+                waiters.begin(),
+                waiters.end(),
+                [&](const auto& w) { return w.get() == waiter.get(); }),
+            waiters.end());
+        throw;
+      }
     }
 
     const auto timeout =
@@ -124,42 +135,50 @@ struct AngleManager::Impl {
     if (maxsize == 0) {
       throw ValidationError("maxsize must be positive");
     }
-
-    {
-      std::lock_guard<std::mutex> lock(streaming_mutex);
-      if (streaming_queue.has_value()) {
-        throw StateError("Streaming is already active. Call stop_streaming() first.");
-      }
-      streaming_queue = IterableQueue<AngleData>(maxsize);
-      streaming_interval_ms = interval_ms;
-      streaming_running.store(true);
+    if (!dispatcher.is_running()) {
+      throw StateError("CAN dispatcher is stopped");
     }
 
-    streaming_thread = std::thread([this] {
-      try {
-        streaming_loop();
-      } catch (...) {
+    IterableQueue<AngleData> queue(maxsize);
+    {
+      std::lock_guard<std::mutex> lock(streaming_mutex);
+      if (streaming_queue.has_value() || streaming_thread.joinable()) {
+        throw StateError("Streaming is already active. Call stop_streaming() first.");
       }
-    });
+      streaming_queue = queue;
+      streaming_running.store(true);
+      try {
+        streaming_thread = std::thread([this, interval_ms, queue] {
+          try {
+            streaming_loop(interval_ms);
+          } catch (...) {
+          }
+          queue.close();
+          streaming_running.store(false);
+        });
+      } catch (...) {
+        streaming_running.store(false);
+        streaming_queue.reset();
+        throw;
+      }
+    }
 
-    std::lock_guard<std::mutex> lock(streaming_mutex);
-    return *streaming_queue;
+    return queue;
   }
 
   void stop_streaming() {
-    std::optional<IterableQueue<AngleData>> queue_to_close;
-    {
-      std::lock_guard<std::mutex> lock(streaming_mutex);
-      if (!streaming_queue.has_value()) {
-        return;
+    std::lock_guard<std::mutex> lock(streaming_mutex);
+    if (!streaming_queue.has_value()) {
+      if (streaming_thread.joinable()) {
+        streaming_running.store(false);
+        streaming_thread.join();
       }
-      streaming_running.store(false);
-      queue_to_close = streaming_queue;
-      streaming_queue.reset();
-      streaming_interval_ms.reset();
+      return;
     }
 
-    queue_to_close->close();
+    streaming_running.store(false);
+    streaming_queue->close();
+    streaming_queue.reset();
     if (streaming_thread.joinable()) {
       streaming_thread.join();
     }
@@ -174,16 +193,7 @@ struct AngleManager::Impl {
     dispatcher.send(msg);
   }
 
-  void streaming_loop() {
-    double interval_ms = 0.0;
-    {
-      std::lock_guard<std::mutex> lock(streaming_mutex);
-      if (!streaming_interval_ms.has_value()) {
-        throw StateError("Streaming is not active. Call stream() first.");
-      }
-      interval_ms = *streaming_interval_ms;
-    }
-
+  void streaming_loop(double interval_ms) {
     const auto sleep_duration =
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             std::chrono::duration<double, std::milli>(interval_ms));
@@ -246,6 +256,8 @@ struct AngleManager::Impl {
 
     try {
       q->put_nowait(data);
+    } catch (const StateError&) {
+      return;
     } catch (const QueueFull&) {
       try {
         q->get_nowait();
@@ -267,7 +279,6 @@ struct AngleManager::Impl {
 
   mutable std::mutex streaming_mutex;
   std::optional<IterableQueue<AngleData>> streaming_queue;
-  std::optional<double> streaming_interval_ms;
   std::atomic<bool> streaming_running{false};
   std::thread streaming_thread;
 };

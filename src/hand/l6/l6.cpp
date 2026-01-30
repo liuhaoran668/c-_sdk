@@ -22,7 +22,7 @@ L6::~L6() {
 }
 
 void L6::close() {
-  if (closed_) {
+  if (closed_.exchange(true, std::memory_order_acq_rel)) {
     return;
   }
 
@@ -39,18 +39,15 @@ void L6::close() {
     dispatcher_.stop();
   } catch (...) {
   }
-
-  closed_ = true;
 }
 
-bool L6::is_closed() const { return closed_; }
+bool L6::is_closed() const { return closed_.load(std::memory_order_acquire); }
 
 void L6::ensure_open() const {
-  if (closed_) {
+  if (closed_.load(std::memory_order_acquire)) {
     throw StateError(
         "L6 interface is closed. Create a new instance or use context manager.");
   }
 }
 
 }  // namespace linkerhand::hand::l6
-

@@ -65,7 +65,7 @@ class IterableQueue {
     return state_->queue.empty();
   }
 
-  void close() {
+  void close() const {
     std::lock_guard<std::mutex> lock(state_->mutex);
     state_->closed = true;
     state_->cv_not_empty.notify_all();

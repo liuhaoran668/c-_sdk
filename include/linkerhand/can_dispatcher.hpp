@@ -2,9 +2,12 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -42,8 +45,39 @@ class CANMessageDispatcher {
 
   void send(const CanMessage& msg);
   void stop();
+  bool is_running() const noexcept { return running_.load(std::memory_order_acquire); }
 
  private:
+  static constexpr std::size_t kSubscriberQueueMax = 64;
+
+  struct SubscriberState {
+    SubscriberState(std::size_t id_, Callback callback_);
+
+    bool try_enter();
+    void exit();
+
+    void deactivate();
+    void wait_for_idle();
+
+    std::size_t id = 0;
+    Callback callback;
+
+    std::atomic<bool> active{true};
+    std::atomic<std::size_t> in_flight{0};
+    std::mutex mutex;
+    std::condition_variable cv;
+
+    std::mutex queue_mutex;
+    std::deque<CanMessage> pending_messages;
+    bool worker_scheduled = false;
+    std::size_t dropped_messages = 0;
+  };
+
+  void start_callback_pool();
+  void stop_callback_pool() noexcept;
+  bool submit_callback_task(std::function<void()> task);
+  static void drain_subscriber_queue(std::shared_ptr<SubscriberState> subscriber);
+
   void recv_loop();
 
   std::string interface_name_;
@@ -53,9 +87,17 @@ class CANMessageDispatcher {
   std::atomic<bool> running_{false};
   std::thread recv_thread_;
 
+  std::mutex socket_mutex_;
+
+  std::atomic<bool> callbacks_running_{false};
+  std::mutex callbacks_mutex_;
+  std::condition_variable callbacks_cv_;
+  std::deque<std::function<void()>> callbacks_tasks_;
+  std::vector<std::thread> callback_threads_;
+
   std::mutex subscribers_mutex_;
   std::size_t next_subscription_id_ = 1;
-  std::vector<std::pair<std::size_t, Callback>> subscribers_;
+  std::vector<std::shared_ptr<SubscriberState>> subscribers_;
 };
 
 }  // namespace linkerhand
