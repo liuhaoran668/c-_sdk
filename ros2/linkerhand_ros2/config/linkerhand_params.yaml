@@ -1,0 +1,14 @@
+/**:
+  ros__parameters:
+    side: "left"
+    can_interface: "can0"
+    publish_rate: 100.0
+    timeout_ms: 50.0
+    enable_force_sensors: true
+    joint_names:
+      - "thumb"
+      - "index"
+      - "middle"
+      - "ring"
+      - "little"
+      - "thumb_rotation"
