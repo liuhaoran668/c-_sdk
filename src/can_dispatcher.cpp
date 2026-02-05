@@ -19,62 +19,6 @@
 
 namespace linkerhand {
 
-namespace {
-
-thread_local std::size_t tls_current_subscription_id = 0;
-
-class SubscriptionCallbackScope final {
- public:
-  explicit SubscriptionCallbackScope(std::size_t subscription_id)
-      : previous_(tls_current_subscription_id) {
-    tls_current_subscription_id = subscription_id;
-  }
-
-  ~SubscriptionCallbackScope() { tls_current_subscription_id = previous_; }
-
-  SubscriptionCallbackScope(const SubscriptionCallbackScope&) = delete;
-  SubscriptionCallbackScope& operator=(const SubscriptionCallbackScope&) = delete;
-
- private:
-  std::size_t previous_ = 0;
-};
-
-}  // namespace
-
-CANMessageDispatcher::SubscriberState::SubscriberState(std::size_t id_, Callback callback_)
-    : id(id_), callback(std::move(callback_)) {}
-
-bool CANMessageDispatcher::SubscriberState::try_enter() {
-  if (!active.load(std::memory_order_acquire)) {
-    return false;
-  }
-
-  in_flight.fetch_add(1, std::memory_order_acq_rel);
-  if (!active.load(std::memory_order_acquire)) {
-    exit();
-    return false;
-  }
-
-  return true;
-}
-
-void CANMessageDispatcher::SubscriberState::exit() {
-  const std::size_t prev = in_flight.fetch_sub(1, std::memory_order_acq_rel);
-  if (prev == 1) {
-    std::lock_guard<std::mutex> lock(mutex);
-    cv.notify_all();
-  }
-}
-
-void CANMessageDispatcher::SubscriberState::deactivate() {
-  active.store(false, std::memory_order_release);
-}
-
-void CANMessageDispatcher::SubscriberState::wait_for_idle() {
-  std::unique_lock<std::mutex> lock(mutex);
-  cv.wait(lock, [&] { return in_flight.load(std::memory_order_acquire) == 0; });
-}
-
 CANMessageDispatcher::CANMessageDispatcher(
     const std::string& interface_name,
     const std::string& interface_type)
@@ -138,28 +82,16 @@ std::size_t CANMessageDispatcher::subscribe(Callback callback) {
 }
 
 void CANMessageDispatcher::unsubscribe(std::size_t subscription_id) {
-  std::shared_ptr<SubscriberState> subscriber;
-  {
-    std::lock_guard<std::mutex> lock(subscribers_mutex_);
-    const auto it = std::find_if(
-        subscribers_.begin(),
-        subscribers_.end(),
-        [&](const auto& entry) { return entry->id == subscription_id; });
-    if (it == subscribers_.end()) {
-      return;
-    }
-    subscriber = *it;
-    subscribers_.erase(it);
-  }
-
-  subscriber->deactivate();
-
-  const bool on_recv_thread = std::this_thread::get_id() == recv_thread_id_;
-  const bool in_own_callback = tls_current_subscription_id == subscriber->id;
-  if (on_recv_thread || in_own_callback) {
+  std::lock_guard<std::mutex> lock(subscribers_mutex_);
+  const auto it = std::find_if(
+      subscribers_.begin(),
+      subscribers_.end(),
+      [&](const auto& entry) { return entry->id == subscription_id; });
+  if (it == subscribers_.end()) {
     return;
   }
-  subscriber->wait_for_idle();
+  (*it)->deactivate();
+  subscribers_.erase(it);
 }
 
 void CANMessageDispatcher::send(const CanMessage& msg) {
@@ -272,20 +204,17 @@ void CANMessageDispatcher::recv_loop() {
     }
 
     for (const auto& subscriber : subscribers_copy) {
-      if (!subscriber->try_enter()) {
+      if (!subscriber->active.load(std::memory_order_acquire)) {
         continue;
       }
 
       try {
-        SubscriptionCallbackScope scope(subscriber->id);
         subscriber->callback(msg);
       } catch (const std::exception& e) {
         std::cerr << "CANMessageDispatcher callback error: " << e.what() << "\n";
       } catch (...) {
         std::cerr << "CANMessageDispatcher callback error: unknown\n";
       }
-
-      subscriber->exit();
     }
   }
 #endif

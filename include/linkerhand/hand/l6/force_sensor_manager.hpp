@@ -10,6 +10,7 @@
 
 #include "linkerhand/can_dispatcher.hpp"
 #include "linkerhand/iterable_queue.hpp"
+#include "linkerhand/lifecycle.hpp"
 
 namespace linkerhand::hand::l6 {
 
@@ -32,6 +33,11 @@ class SingleForceSensorManager {
       std::uint32_t arbitration_id,
       CANMessageDispatcher& dispatcher,
       std::uint8_t command_prefix);
+  SingleForceSensorManager(
+      std::uint32_t arbitration_id,
+      CANMessageDispatcher& dispatcher,
+      std::uint8_t command_prefix,
+      std::shared_ptr<linkerhand::Lifecycle> lifecycle);
   ~SingleForceSensorManager();
 
   SingleForceSensorManager(const SingleForceSensorManager&) = delete;
@@ -46,11 +52,16 @@ class SingleForceSensorManager {
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  std::shared_ptr<linkerhand::Lifecycle> lifecycle_;
 };
 
 class ForceSensorManager {
  public:
   ForceSensorManager(std::uint32_t arbitration_id, CANMessageDispatcher& dispatcher);
+  ForceSensorManager(
+      std::uint32_t arbitration_id,
+      CANMessageDispatcher& dispatcher,
+      std::shared_ptr<linkerhand::Lifecycle> lifecycle);
   ~ForceSensorManager();
 
   ForceSensorManager(const ForceSensorManager&) = delete;
@@ -66,7 +77,7 @@ class ForceSensorManager {
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  std::shared_ptr<linkerhand::Lifecycle> lifecycle_;
 };
 
 }  // namespace linkerhand::hand::l6
-

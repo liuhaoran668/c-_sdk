@@ -63,16 +63,29 @@ struct ForceWaiter {
 }  // namespace
 
 struct SingleForceSensorManager::Impl {
-  Impl(std::uint32_t arbitration_id_, CANMessageDispatcher& dispatcher_, std::uint8_t command_prefix_)
+  Impl(
+      std::uint32_t arbitration_id_,
+      CANMessageDispatcher& dispatcher_,
+      std::uint8_t command_prefix_,
+      std::shared_ptr<linkerhand::Lifecycle> lifecycle_)
       : arbitration_id(arbitration_id_),
         dispatcher(dispatcher_),
-        command_prefix(command_prefix_) {
+        command_prefix(command_prefix_),
+        lifecycle(std::move(lifecycle_)) {
+    if (!lifecycle) {
+      throw ValidationError("lifecycle must not be null");
+    }
     subscription_id = dispatcher.subscribe([this](const CanMessage& msg) { on_message(msg); });
+    lifecycle_subscription_id = lifecycle->subscribe([this] { notify_waiters(); });
   }
 
   ~Impl() {
     try {
       stop_streaming();
+    } catch (...) {
+    }
+    try {
+      lifecycle->unsubscribe(lifecycle_subscription_id);
     } catch (...) {
     }
     dispatcher.unsubscribe(subscription_id);
@@ -107,7 +120,8 @@ struct SingleForceSensorManager::Impl {
             std::chrono::duration<double, std::milli>(timeout_ms));
 
     std::unique_lock<std::mutex> waiter_lock(waiter->mutex);
-    const bool ok = waiter->cv.wait_for(waiter_lock, timeout, [&] { return waiter->ready; });
+    const bool ok = waiter->cv.wait_for(
+        waiter_lock, timeout, [&] { return waiter->ready || lifecycle->state() != linkerhand::LifecycleState::Open; });
     if (ok && waiter->data.has_value()) {
       return *waiter->data;
     }
@@ -122,6 +136,8 @@ struct SingleForceSensorManager::Impl {
           waiters.end());
     }
 
+    // If lifecycle is no longer open, throw StateError before TimeoutError
+    lifecycle->ensure_open();
     throw TimeoutError("No data received within " + std::to_string(timeout_ms) + "ms");
   }
 
@@ -207,6 +223,17 @@ struct SingleForceSensorManager::Impl {
     }
   }
 
+  void notify_waiters() {
+    std::vector<std::shared_ptr<ForceWaiter>> waiters_copy;
+    {
+      std::lock_guard<std::mutex> lock(waiters_mutex);
+      waiters_copy = waiters;
+    }
+    for (const auto& waiter : waiters_copy) {
+      waiter->cv.notify_one();
+    }
+  }
+
   void on_message(const CanMessage& msg) {
     if (msg.arbitration_id != arbitration_id) {
       return;
@@ -285,6 +312,8 @@ struct SingleForceSensorManager::Impl {
   CANMessageDispatcher& dispatcher;
   std::uint8_t command_prefix;
   std::size_t subscription_id = 0;
+  std::shared_ptr<linkerhand::Lifecycle> lifecycle;
+  std::size_t lifecycle_subscription_id = 0;
 
   std::optional<FrameBatch> frame_batch;
 
@@ -304,32 +333,58 @@ SingleForceSensorManager::SingleForceSensorManager(
     std::uint32_t arbitration_id,
     CANMessageDispatcher& dispatcher,
     std::uint8_t command_prefix)
-    : impl_(std::make_unique<Impl>(arbitration_id, dispatcher, command_prefix)) {}
+    : SingleForceSensorManager(
+          arbitration_id,
+          dispatcher,
+          command_prefix,
+          std::make_shared<linkerhand::Lifecycle>("SingleForceSensorManager")) {}
+
+SingleForceSensorManager::SingleForceSensorManager(
+    std::uint32_t arbitration_id,
+    CANMessageDispatcher& dispatcher,
+    std::uint8_t command_prefix,
+    std::shared_ptr<linkerhand::Lifecycle> lifecycle)
+    : impl_(std::make_unique<Impl>(arbitration_id, dispatcher, command_prefix, lifecycle)),
+      lifecycle_(std::move(lifecycle)) {}
 
 SingleForceSensorManager::~SingleForceSensorManager() = default;
 
 ForceSensorData SingleForceSensorManager::get_data_blocking(double timeout_ms) {
+  lifecycle_->ensure_open();
   return impl_->get_data_blocking(timeout_ms);
 }
 
 std::optional<ForceSensorData> SingleForceSensorManager::get_latest_data() const {
+  lifecycle_->ensure_open();
   return impl_->get_latest_data();
 }
 
 IterableQueue<ForceSensorData> SingleForceSensorManager::stream(double interval_ms, std::size_t maxsize) {
+  lifecycle_->ensure_open();
   return impl_->stream(interval_ms, maxsize);
 }
 
-void SingleForceSensorManager::stop_streaming() { impl_->stop_streaming(); }
+void SingleForceSensorManager::stop_streaming() {
+  // stop_streaming is a cleanup operation, allowed in any lifecycle state
+  impl_->stop_streaming();
+}
 
 struct ForceSensorManager::Impl {
-  explicit Impl(std::uint32_t arbitration_id_, CANMessageDispatcher& dispatcher_)
-      : arbitration_id(arbitration_id_), dispatcher(dispatcher_) {
-    fingers.emplace("thumb", std::make_unique<SingleForceSensorManager>(arbitration_id, dispatcher, 0xB1));
-    fingers.emplace("index", std::make_unique<SingleForceSensorManager>(arbitration_id, dispatcher, 0xB2));
-    fingers.emplace("middle", std::make_unique<SingleForceSensorManager>(arbitration_id, dispatcher, 0xB3));
-    fingers.emplace("ring", std::make_unique<SingleForceSensorManager>(arbitration_id, dispatcher, 0xB4));
-    fingers.emplace("pinky", std::make_unique<SingleForceSensorManager>(arbitration_id, dispatcher, 0xB5));
+  explicit Impl(
+      std::uint32_t arbitration_id_,
+      CANMessageDispatcher& dispatcher_,
+      std::shared_ptr<linkerhand::Lifecycle> lifecycle_)
+      : arbitration_id(arbitration_id_),
+        dispatcher(dispatcher_),
+        lifecycle(std::move(lifecycle_)) {
+    if (!lifecycle) {
+      throw ValidationError("lifecycle must not be null");
+    }
+    fingers.emplace("thumb", std::make_unique<SingleForceSensorManager>(arbitration_id, dispatcher, 0xB1, lifecycle));
+    fingers.emplace("index", std::make_unique<SingleForceSensorManager>(arbitration_id, dispatcher, 0xB2, lifecycle));
+    fingers.emplace("middle", std::make_unique<SingleForceSensorManager>(arbitration_id, dispatcher, 0xB3, lifecycle));
+    fingers.emplace("ring", std::make_unique<SingleForceSensorManager>(arbitration_id, dispatcher, 0xB4, lifecycle));
+    fingers.emplace("pinky", std::make_unique<SingleForceSensorManager>(arbitration_id, dispatcher, 0xB5, lifecycle));
   }
 
   ~Impl() {
@@ -514,6 +569,7 @@ struct ForceSensorManager::Impl {
 
   std::uint32_t arbitration_id;
   CANMessageDispatcher& dispatcher;
+  std::shared_ptr<linkerhand::Lifecycle> lifecycle;
 
   std::unordered_map<std::string, std::unique_ptr<SingleForceSensorManager>> fingers;
 
@@ -525,21 +581,34 @@ struct ForceSensorManager::Impl {
 };
 
 ForceSensorManager::ForceSensorManager(std::uint32_t arbitration_id, CANMessageDispatcher& dispatcher)
-    : impl_(std::make_unique<Impl>(arbitration_id, dispatcher)) {}
+    : ForceSensorManager(arbitration_id, dispatcher, std::make_shared<linkerhand::Lifecycle>("ForceSensorManager")) {}
+
+ForceSensorManager::ForceSensorManager(
+    std::uint32_t arbitration_id,
+    CANMessageDispatcher& dispatcher,
+    std::shared_ptr<linkerhand::Lifecycle> lifecycle)
+    : impl_(std::make_unique<Impl>(arbitration_id, dispatcher, lifecycle)),
+      lifecycle_(std::move(lifecycle)) {}
 
 ForceSensorManager::~ForceSensorManager() = default;
 
 AllFingersData ForceSensorManager::get_data_blocking(double timeout_ms) {
+  lifecycle_->ensure_open();
   return impl_->get_data_blocking(timeout_ms);
 }
 
 IterableQueue<AllFingersData> ForceSensorManager::stream(double interval_ms, std::size_t maxsize) {
+  lifecycle_->ensure_open();
   return impl_->stream(interval_ms, maxsize);
 }
 
-void ForceSensorManager::stop_streaming() { impl_->stop_streaming(); }
+void ForceSensorManager::stop_streaming() {
+  // stop_streaming is a cleanup operation, allowed in any lifecycle state
+  impl_->stop_streaming();
+}
 
 std::unordered_map<std::string, std::optional<ForceSensorData>> ForceSensorManager::get_latest_data() const {
+  lifecycle_->ensure_open();
   return impl_->get_latest_data();
 }
 
