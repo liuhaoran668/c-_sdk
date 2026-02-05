@@ -27,14 +27,27 @@ struct AngleWaiter {
 }  // namespace
 
 struct AngleManager::Impl {
-  Impl(std::uint32_t arbitration_id_, CANMessageDispatcher& dispatcher_)
-      : arbitration_id(arbitration_id_), dispatcher(dispatcher_) {
+  Impl(
+      std::uint32_t arbitration_id_,
+      CANMessageDispatcher& dispatcher_,
+      std::shared_ptr<linkerhand::Lifecycle> lifecycle_)
+      : arbitration_id(arbitration_id_),
+        dispatcher(dispatcher_),
+        lifecycle(std::move(lifecycle_)) {
+    if (!lifecycle) {
+      throw ValidationError("lifecycle must not be null");
+    }
     subscription_id = dispatcher.subscribe([this](const CanMessage& msg) { on_message(msg); });
+    lifecycle_subscription_id = lifecycle->subscribe([this] { notify_waiters(); });
   }
 
   ~Impl() {
     try {
       stop_streaming();
+    } catch (...) {
+    }
+    try {
+      lifecycle->unsubscribe(lifecycle_subscription_id);
     } catch (...) {
     }
     dispatcher.unsubscribe(subscription_id);
@@ -86,7 +99,18 @@ struct AngleManager::Impl {
       is_streaming = streaming_queue.has_value();
     }
     if (!is_streaming) {
-      send_sense_request();
+      try {
+        send_sense_request();
+      } catch (...) {
+        std::lock_guard<std::mutex> lock(waiters_mutex);
+        waiters.erase(
+            std::remove_if(
+                waiters.begin(),
+                waiters.end(),
+                [&](const auto& w) { return w.get() == waiter.get(); }),
+            waiters.end());
+        throw;
+      }
     }
 
     const auto timeout =
@@ -94,7 +118,8 @@ struct AngleManager::Impl {
             std::chrono::duration<double, std::milli>(timeout_ms));
 
     std::unique_lock<std::mutex> waiter_lock(waiter->mutex);
-    const bool ok = waiter->cv.wait_for(waiter_lock, timeout, [&] { return waiter->ready; });
+    const bool ok = waiter->cv.wait_for(
+        waiter_lock, timeout, [&] { return waiter->ready || lifecycle->state() != linkerhand::LifecycleState::Open; });
     if (ok && waiter->data.has_value()) {
       return *waiter->data;
     }
@@ -109,6 +134,8 @@ struct AngleManager::Impl {
           waiters.end());
     }
 
+    // If lifecycle is no longer open, throw StateError before TimeoutError
+    lifecycle->ensure_open();
     throw TimeoutError("No angle data received within " + std::to_string(timeout_ms) + "ms");
   }
 
@@ -124,42 +151,50 @@ struct AngleManager::Impl {
     if (maxsize == 0) {
       throw ValidationError("maxsize must be positive");
     }
-
-    {
-      std::lock_guard<std::mutex> lock(streaming_mutex);
-      if (streaming_queue.has_value()) {
-        throw StateError("Streaming is already active. Call stop_streaming() first.");
-      }
-      streaming_queue = IterableQueue<AngleData>(maxsize);
-      streaming_interval_ms = interval_ms;
-      streaming_running.store(true);
+    if (!dispatcher.is_running()) {
+      throw StateError("CAN dispatcher is stopped");
     }
 
-    streaming_thread = std::thread([this] {
-      try {
-        streaming_loop();
-      } catch (...) {
+    IterableQueue<AngleData> queue(maxsize);
+    {
+      std::lock_guard<std::mutex> lock(streaming_mutex);
+      if (streaming_queue.has_value() || streaming_thread.joinable()) {
+        throw StateError("Streaming is already active. Call stop_streaming() first.");
       }
-    });
+      streaming_queue = queue;
+      streaming_running.store(true);
+      try {
+        streaming_thread = std::thread([this, interval_ms, queue] {
+          try {
+            streaming_loop(interval_ms);
+          } catch (...) {
+          }
+          queue.close();
+          streaming_running.store(false);
+        });
+      } catch (...) {
+        streaming_running.store(false);
+        streaming_queue.reset();
+        throw;
+      }
+    }
 
-    std::lock_guard<std::mutex> lock(streaming_mutex);
-    return *streaming_queue;
+    return queue;
   }
 
   void stop_streaming() {
-    std::optional<IterableQueue<AngleData>> queue_to_close;
-    {
-      std::lock_guard<std::mutex> lock(streaming_mutex);
-      if (!streaming_queue.has_value()) {
-        return;
+    std::lock_guard<std::mutex> lock(streaming_mutex);
+    if (!streaming_queue.has_value()) {
+      if (streaming_thread.joinable()) {
+        streaming_running.store(false);
+        streaming_thread.join();
       }
-      streaming_running.store(false);
-      queue_to_close = streaming_queue;
-      streaming_queue.reset();
-      streaming_interval_ms.reset();
+      return;
     }
 
-    queue_to_close->close();
+    streaming_running.store(false);
+    streaming_queue->close();
+    streaming_queue.reset();
     if (streaming_thread.joinable()) {
       streaming_thread.join();
     }
@@ -174,16 +209,7 @@ struct AngleManager::Impl {
     dispatcher.send(msg);
   }
 
-  void streaming_loop() {
-    double interval_ms = 0.0;
-    {
-      std::lock_guard<std::mutex> lock(streaming_mutex);
-      if (!streaming_interval_ms.has_value()) {
-        throw StateError("Streaming is not active. Call stream() first.");
-      }
-      interval_ms = *streaming_interval_ms;
-    }
-
+  void streaming_loop(double interval_ms) {
     const auto sleep_duration =
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             std::chrono::duration<double, std::milli>(interval_ms));
@@ -191,6 +217,17 @@ struct AngleManager::Impl {
     while (streaming_running.load()) {
       send_sense_request();
       std::this_thread::sleep_for(sleep_duration);
+    }
+  }
+
+  void notify_waiters() {
+    std::vector<std::shared_ptr<AngleWaiter>> waiters_copy;
+    {
+      std::lock_guard<std::mutex> lock(waiters_mutex);
+      waiters_copy = waiters;
+    }
+    for (const auto& waiter : waiters_copy) {
+      waiter->cv.notify_one();
     }
   }
 
@@ -246,6 +283,8 @@ struct AngleManager::Impl {
 
     try {
       q->put_nowait(data);
+    } catch (const StateError&) {
+      return;
     } catch (const QueueFull&) {
       try {
         q->get_nowait();
@@ -258,6 +297,8 @@ struct AngleManager::Impl {
   std::uint32_t arbitration_id;
   CANMessageDispatcher& dispatcher;
   std::size_t subscription_id = 0;
+  std::shared_ptr<linkerhand::Lifecycle> lifecycle;
+  std::size_t lifecycle_subscription_id = 0;
 
   mutable std::mutex latest_mutex;
   std::optional<AngleData> latest_data;
@@ -267,31 +308,49 @@ struct AngleManager::Impl {
 
   mutable std::mutex streaming_mutex;
   std::optional<IterableQueue<AngleData>> streaming_queue;
-  std::optional<double> streaming_interval_ms;
   std::atomic<bool> streaming_running{false};
   std::thread streaming_thread;
 };
 
 AngleManager::AngleManager(std::uint32_t arbitration_id, CANMessageDispatcher& dispatcher)
-    : impl_(std::make_unique<Impl>(arbitration_id, dispatcher)) {}
+    : AngleManager(arbitration_id, dispatcher, std::make_shared<linkerhand::Lifecycle>("AngleManager")) {}
+
+AngleManager::AngleManager(
+    std::uint32_t arbitration_id,
+    CANMessageDispatcher& dispatcher,
+    std::shared_ptr<linkerhand::Lifecycle> lifecycle)
+    : impl_(std::make_unique<Impl>(arbitration_id, dispatcher, lifecycle)),
+      lifecycle_(std::move(lifecycle)) {}
 
 AngleManager::~AngleManager() = default;
 
-void AngleManager::set_angles(const std::array<int, 6>& angles) { impl_->set_angles(angles); }
-void AngleManager::set_angles(const std::vector<int>& angles) { impl_->set_angles(angles); }
+void AngleManager::set_angles(const std::array<int, 6>& angles) {
+  lifecycle_->ensure_open();
+  impl_->set_angles(angles);
+}
+void AngleManager::set_angles(const std::vector<int>& angles) {
+  lifecycle_->ensure_open();
+  impl_->set_angles(angles);
+}
 
 AngleData AngleManager::get_angles_blocking(double timeout_ms) {
+  lifecycle_->ensure_open();
   return impl_->get_angles_blocking(timeout_ms);
 }
 
 std::optional<AngleData> AngleManager::get_current_angles() const {
+  lifecycle_->ensure_open();
   return impl_->get_current_angles();
 }
 
 IterableQueue<AngleData> AngleManager::stream(double interval_ms, std::size_t maxsize) {
+  lifecycle_->ensure_open();
   return impl_->stream(interval_ms, maxsize);
 }
 
-void AngleManager::stop_streaming() { impl_->stop_streaming(); }
+void AngleManager::stop_streaming() {
+  // stop_streaming is a cleanup operation, allowed in any lifecycle state
+  impl_->stop_streaming();
+}
 
 }  // namespace linkerhand::hand::l6

@@ -14,3 +14,18 @@ target_include_directories(linkerhand_cpp_sdk PUBLIC "${CMAKE_CURRENT_SOURCE_DIR
 find_package(Threads REQUIRED)
 target_link_libraries(linkerhand_cpp_sdk PRIVATE Threads::Threads)
 
+# ============================================================================
+# 测试程序
+# ============================================================================
+option(BUILD_TESTS "Build test programs" ON)
+
+if(BUILD_TESTS)
+  # 压力传感器测试
+  add_executable(test_force_sensor tests/test_force_sensor.cpp)
+  target_link_libraries(test_force_sensor PRIVATE linkerhand_cpp_sdk Threads::Threads)
+
+  # 角度控制测试
+  add_executable(test_angle tests/test_angle.cpp)
+  target_link_libraries(test_angle PRIVATE linkerhand_cpp_sdk Threads::Threads)
+endif()
+

@@ -9,6 +9,7 @@
 
 #include "linkerhand/can_dispatcher.hpp"
 #include "linkerhand/iterable_queue.hpp"
+#include "linkerhand/lifecycle.hpp"
 
 namespace linkerhand::hand::l6 {
 
@@ -20,6 +21,10 @@ struct AngleData {
 class AngleManager {
  public:
   AngleManager(std::uint32_t arbitration_id, CANMessageDispatcher& dispatcher);
+  AngleManager(
+      std::uint32_t arbitration_id,
+      CANMessageDispatcher& dispatcher,
+      std::shared_ptr<linkerhand::Lifecycle> lifecycle);
   ~AngleManager();
 
   AngleManager(const AngleManager&) = delete;
@@ -37,7 +42,7 @@ class AngleManager {
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  std::shared_ptr<linkerhand::Lifecycle> lifecycle_;
 };
 
 }  // namespace linkerhand::hand::l6
-

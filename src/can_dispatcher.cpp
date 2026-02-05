@@ -54,8 +54,16 @@ CANMessageDispatcher::CANMessageDispatcher(
     throw CANError(std::string("Failed to bind CAN socket: ") + std::strerror(saved_errno));
   }
 
-  running_.store(true);
-  recv_thread_ = std::thread(&CANMessageDispatcher::recv_loop, this);
+  running_.store(true, std::memory_order_release);
+  try {
+    recv_thread_ = std::thread(&CANMessageDispatcher::recv_loop, this);
+    recv_thread_id_ = recv_thread_.get_id();
+  } catch (...) {
+    running_.store(false, std::memory_order_release);
+    ::close(socket_fd_);
+    socket_fd_ = -1;
+    throw;
+  }
 #endif
 }
 
@@ -69,18 +77,21 @@ CANMessageDispatcher::~CANMessageDispatcher() {
 std::size_t CANMessageDispatcher::subscribe(Callback callback) {
   std::lock_guard<std::mutex> lock(subscribers_mutex_);
   const std::size_t id = next_subscription_id_++;
-  subscribers_.push_back({id, std::move(callback)});
+  subscribers_.push_back(std::make_shared<SubscriberState>(id, std::move(callback)));
   return id;
 }
 
 void CANMessageDispatcher::unsubscribe(std::size_t subscription_id) {
   std::lock_guard<std::mutex> lock(subscribers_mutex_);
-  subscribers_.erase(
-      std::remove_if(
-          subscribers_.begin(),
-          subscribers_.end(),
-          [&](const auto& entry) { return entry.first == subscription_id; }),
-      subscribers_.end());
+  const auto it = std::find_if(
+      subscribers_.begin(),
+      subscribers_.end(),
+      [&](const auto& entry) { return entry->id == subscription_id; });
+  if (it == subscribers_.end()) {
+    return;
+  }
+  (*it)->deactivate();
+  subscribers_.erase(it);
 }
 
 void CANMessageDispatcher::send(const CanMessage& msg) {
@@ -88,6 +99,13 @@ void CANMessageDispatcher::send(const CanMessage& msg) {
   (void)msg;
   throw CANError("SocketCAN backend is only supported on Linux");
 #else
+  if (!running_.load(std::memory_order_acquire)) {
+    throw StateError("CAN dispatcher is stopped");
+  }
+  std::lock_guard<std::mutex> lock(socket_mutex_);
+  if (!running_.load(std::memory_order_acquire)) {
+    throw StateError("CAN dispatcher is stopped");
+  }
   if (socket_fd_ < 0) {
     throw CANError("CAN dispatcher is not initialized");
   }
@@ -118,10 +136,14 @@ void CANMessageDispatcher::stop() {
 #ifndef __linux__
   return;
 #else
-  const bool was_running = running_.exchange(false);
-  if (was_running && recv_thread_.joinable()) {
-    recv_thread_.join();
+  running_.store(false, std::memory_order_release);
+  if (std::this_thread::get_id() != recv_thread_id_) {
+    std::lock_guard<std::mutex> lock(recv_thread_join_mutex_);
+    if (recv_thread_.joinable()) {
+      recv_thread_.join();
+    }
   }
+  std::lock_guard<std::mutex> lock(socket_mutex_);
   if (socket_fd_ >= 0) {
     ::close(socket_fd_);
     socket_fd_ = -1;
@@ -175,16 +197,19 @@ void CANMessageDispatcher::recv_loop() {
       msg.data[i] = frame.data[i];
     }
 
-    std::vector<std::pair<std::size_t, Callback>> subscribers_copy;
+    std::vector<std::shared_ptr<SubscriberState>> subscribers_copy;
     {
       std::lock_guard<std::mutex> lock(subscribers_mutex_);
       subscribers_copy = subscribers_;
     }
 
-    for (const auto& [id, cb] : subscribers_copy) {
-      (void)id;
+    for (const auto& subscriber : subscribers_copy) {
+      if (!subscriber->active.load(std::memory_order_acquire)) {
+        continue;
+      }
+
       try {
-        cb(msg);
+        subscriber->callback(msg);
       } catch (const std::exception& e) {
         std::cerr << "CANMessageDispatcher callback error: " << e.what() << "\n";
       } catch (...) {
@@ -196,4 +221,3 @@ void CANMessageDispatcher::recv_loop() {
 }
 
 }  // namespace linkerhand
-
