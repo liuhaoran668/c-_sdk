@@ -2,7 +2,6 @@
 
 #include <array>
 #include <atomic>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -48,21 +47,14 @@ class CANMessageDispatcher {
 
  private:
   struct SubscriberState {
-    SubscriberState(std::size_t id_, Callback callback_);
-
-    bool try_enter();
-    void exit();
-
-    void deactivate();
-    void wait_for_idle();
-
     std::size_t id = 0;
     Callback callback;
-
     std::atomic<bool> active{true};
-    std::atomic<std::size_t> in_flight{0};
-    std::mutex mutex;
-    std::condition_variable cv;
+
+    SubscriberState(std::size_t id_, Callback callback_)
+        : id(id_), callback(std::move(callback_)) {}
+
+    void deactivate() { active.store(false, std::memory_order_release); }
   };
 
   void recv_loop();

@@ -237,16 +237,14 @@ std::vector<std::shared_ptr<SubscriberState>> subscribers_copy;
 }
 
 for (const auto& subscriber : subscribers_copy) {
-  if (!subscriber->try_enter()) {
-    continue;  // 已取消订阅或正在析构
+  if (!subscriber->active.load(std::memory_order_acquire)) {
+    continue;  // 已取消订阅
   }
   try {
     subscriber->callback(msg);  // 回调在 recv_thread_ 中执行
   } catch (const std::exception& e) {
     std::cerr << "CANMessageDispatcher callback error: " << e.what() << "\n";
   }
-  subscriber->exit();
-  // ...
 }
 ```
 
@@ -275,20 +273,12 @@ std::size_t CANMessageDispatcher::subscribe(Callback callback) {
 
 ```cpp
 void CANMessageDispatcher::unsubscribe(std::size_t subscription_id) {
-  std::shared_ptr<SubscriberState> subscriber;
-  {
-    std::lock_guard<std::mutex> lock(subscribers_mutex_);
-    // find + erase
-  }
-  if (!subscriber) {
-    return;
-  }
-  subscriber->deactivate();
+  std::lock_guard<std::mutex> lock(subscribers_mutex_);
+  const auto it = std::find_if(...);
+  if (it == subscribers_.end()) return;
 
-  // 非 recv_thread_ 调用时：等待回调“完全退出”
-  if (!on_recv_thread) {
-    subscriber->wait_for_idle();
-  }
+  (*it)->deactivate();   // 标记为非活跃
+  subscribers_.erase(it);
 }
 ```
 
@@ -297,11 +287,11 @@ void CANMessageDispatcher::unsubscribe(std::size_t subscription_id) {
 | 操作 | 线程安全 | 可在回调中调用 | 说明 |
 |------|----------|----------------|------|
 | `subscribe()` | ✅ | ✅ | 使用 mutex 保护 |
-| `unsubscribe()` | ✅ | ✅ | 取消订阅后（非 recv_thread_ 调用时）会等待回调退出 |
+| `unsubscribe()` | ✅ | ✅ | deactivate 后 recv_loop 跳过该订阅者 |
 
 **快照模式的优点**: `recv_thread_` 在分发前复制 `subscribers_`，释放锁后再执行回调，允许回调中安全调用 `subscribe`/`unsubscribe`。
 
-**新增约束**: 当 `unsubscribe()` 在 `recv_thread_`（即回调栈内）被调用时，为避免自锁/死锁，不会等待 `wait_for_idle()`；因此不应在回调栈内触发“销毁回调目标对象”的行为（例如直接析构持有该回调的 Manager）。
+**架构约束**: 安全退订依赖于 `L6::close()` 的调用顺序——`dispatcher_.stop()` 会 join `recv_thread_`，确保 Manager 析构前没有回调在执行。
 
 ### 4.4 停止时的竞态处理
 
@@ -356,19 +346,15 @@ void stop_streaming() {
 - `stream()` 会先构造并返回队列对象（值语义、共享底层状态），避免并发 `stop_streaming()` 导致的返回引用失效问题。
 - streaming 线程使用 `interval_ms` 的值拷贝，不依赖共享的 `optional` 状态，降低竞态与状态检查复杂度。
 
-#### 4.4.3 析构与回调协调（已修复）
+#### 4.4.3 析构与回调协调
 
-历史版本中，采用“快照分发”会带来一个典型风险：`unsubscribe()` 返回时并不能保证回调已经执行完毕，从而导致析构期间 UAF。
+当前实现采用**架构保证**而非复杂同步机制来确保安全析构：
 
-当前实现通过为每个订阅者引入独立的 `SubscriberState`（`active` + `in_flight` 计数）解决该问题：
+1. `L6::close()` 调用 `dispatcher_.stop()`，join `recv_thread_`
+2. join 返回后，`recv_loop` 不再执行，没有回调在运行
+3. 之后 Manager 按声明逆序析构，`unsubscribe` 安全执行
 
-- `recv_thread_` 在执行回调前调用 `try_enter()`：只有当订阅仍处于 active 状态才允许进入，并将 `in_flight` 计数 +1
-- 回调执行完毕后调用 `exit()`：`in_flight` 计数 -1，并在归零时唤醒等待者
-- `unsubscribe()`：先从订阅列表移除，再 `deactivate()`，最后（非 `recv_thread_` 调用时）`wait_for_idle()` 等待所有 in-flight 回调退出
-
-因此，`Manager::Impl` 析构中调用 `dispatcher.unsubscribe(subscription_id)` 可以在并发场景下避免回调仍在执行时释放 `Impl` 内部状态。
-
-**重要限制**: 当 `unsubscribe()` 在 `recv_thread_`（回调栈内）被调用时不会等待 `wait_for_idle()`，以避免自锁/死锁；此时不应在同一回调栈内触发相关对象的析构。
+**设计简化**：移除了 `in_flight` 计数和 `wait_for_idle()` 机制。安全性完全依赖于 `L6::close()` 保证的调用顺序。
 
 ---
 
@@ -455,7 +441,7 @@ hand.angle.set_angles(angles);
 | 决策 | 理由 | 权衡 |
 |------|------|------|
 | Pimpl 模式 | 隐藏实现细节，ABI 稳定 | 增加间接调用开销 |
-| 快照分发 + in-flight 同步 | 允许回调中修改订阅；避免取消订阅/析构期间 UAF | `unsubscribe()` 在非 recv_thread_ 调用时可能阻塞等待回调退出；增加少量原子/引用计数开销 |
+| 快照分发 + 架构保证 | 允许回调中修改订阅；`stop()` join 保证析构安全 | 依赖调用顺序（`close()` 必须在 Manager 析构前） |
 | 共享状态 Queue | `IterableQueue` 可复制，方便传递 | 需要 `shared_ptr`，增加引用计数开销 |
 | 仅 Linux 支持 | 简化实现，专注 SocketCAN | 无法在非 Linux 平台使用 |
 
@@ -466,7 +452,7 @@ hand.angle.set_angles(angles);
 | ID | 问题描述 | 修复摘要 |
 |----|----------|----------|
 | **F1** | `close()` 幂等但存在数据竞争风险 | `L6/O6::closed_` 使用 `std::atomic<bool>` + `exchange()` |
-| **F2** | `unsubscribe()` 与回调并发导致析构期间 UAF | `SubscriberState(active + in_flight)`；非 recv_thread_ 调用 `unsubscribe()` 会等待回调退出 |
+| **F2** | `unsubscribe()` 与回调并发导致析构期间 UAF | 通过架构保证：`stop()` join `recv_thread_` 后 Manager 才析构 |
 | **F3** | dispatcher stop 后 send 行为未定义 | `CANMessageDispatcher::send()` 对 `running_` 与 `socket_fd_` 做状态检查并抛 `StateError` |
 | **F4** | `stream()` / `stop_streaming()` 并发存在返回引用失效与竞态窗口 | `stream()` 返回队列值对象；streaming 线程使用 `interval_ms` 值拷贝；`stop_streaming()` 关闭队列并 join 线程 |
 | **F5** | `ForceSensorManager` 聚合线程超时退出导致队列不关闭/潜在 UAF | 聚合循环对超时采用 continue；intermediate queue 使用共享所有权并在退出时关闭 |
