@@ -1,0 +1,48 @@
+#pragma once
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <vector>
+
+#include "linkerhand/can_dispatcher.hpp"
+#include "linkerhand/iterable_queue.hpp"
+#include "linkerhand/lifecycle.hpp"
+
+namespace linkerhand::hand::o6 {
+
+struct AngleData {
+  std::array<int, 6> angles{};
+  double timestamp = 0.0;
+};
+
+class AngleManager {
+ public:
+  AngleManager(std::uint32_t arbitration_id, CANMessageDispatcher& dispatcher);
+  AngleManager(
+      std::uint32_t arbitration_id,
+      CANMessageDispatcher& dispatcher,
+      std::shared_ptr<linkerhand::Lifecycle> lifecycle);
+  ~AngleManager();
+
+  AngleManager(const AngleManager&) = delete;
+  AngleManager& operator=(const AngleManager&) = delete;
+
+  void set_angles(const std::array<int, 6>& angles);
+  void set_angles(const std::vector<int>& angles);
+
+  AngleData get_angles_blocking(double timeout_ms = 100);
+  std::optional<AngleData> get_current_angles() const;
+
+  IterableQueue<AngleData> stream(double interval_ms = 100, std::size_t maxsize = 100);
+  void stop_streaming();
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+  std::shared_ptr<linkerhand::Lifecycle> lifecycle_;
+};
+
+}  // namespace linkerhand::hand::o6
