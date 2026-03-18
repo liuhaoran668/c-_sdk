@@ -1,12 +1,11 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <string>
-#include <unordered_map>
 
 #include "linkerhand/can_dispatcher.hpp"
 #include "linkerhand/iterable_queue.hpp"
@@ -14,17 +13,29 @@
 
 namespace linkerhand::hand::l6 {
 
+enum class Finger : std::uint8_t {
+  Thumb = 0,
+  Index = 1,
+  Middle = 2,
+  Ring = 3,
+  Pinky = 4,
+};
+
+inline constexpr std::size_t kFingerCount = 5;
+
+template <typename T>
+using FingerArray = std::array<T, kFingerCount>;
+
 struct ForceSensorData {
   std::array<std::uint8_t, 72> values{};
   double timestamp = 0.0;
 };
 
 struct AllFingersData {
-  ForceSensorData thumb;
-  ForceSensorData index;
-  ForceSensorData middle;
-  ForceSensorData ring;
-  ForceSensorData pinky;
+  FingerArray<ForceSensorData> fingers{};
+
+  ForceSensorData& operator[](Finger f) { return fingers[static_cast<std::size_t>(f)]; }
+  const ForceSensorData& operator[](Finger f) const { return fingers[static_cast<std::size_t>(f)]; }
 };
 
 class SingleForceSensorManager {
@@ -39,10 +50,11 @@ class SingleForceSensorManager {
   SingleForceSensorManager(const SingleForceSensorManager&) = delete;
   SingleForceSensorManager& operator=(const SingleForceSensorManager&) = delete;
 
-  ForceSensorData get_data_blocking(double timeout_ms = 1000);
+  ForceSensorData get_data_blocking(std::chrono::milliseconds timeout = std::chrono::milliseconds{1000});
   std::optional<ForceSensorData> get_latest_data() const;
 
-  IterableQueue<ForceSensorData> stream(double interval_ms = 100, std::size_t maxsize = 100);
+  IterableQueue<ForceSensorData> stream(std::chrono::milliseconds interval = std::chrono::milliseconds{100},
+                                        std::size_t maxsize = 100);
   void stop_streaming();
 
  private:
@@ -62,12 +74,13 @@ class ForceSensorManager {
   ForceSensorManager(const ForceSensorManager&) = delete;
   ForceSensorManager& operator=(const ForceSensorManager&) = delete;
 
-  AllFingersData get_data_blocking(double timeout_ms = 1000);
+  AllFingersData get_data_blocking(std::chrono::milliseconds timeout = std::chrono::milliseconds{1000});
 
-  IterableQueue<AllFingersData> stream(double interval_ms = 100, std::size_t maxsize = 100);
+  IterableQueue<AllFingersData> stream(std::chrono::milliseconds interval = std::chrono::milliseconds{100},
+                                       std::size_t maxsize = 100);
   void stop_streaming();
 
-  std::unordered_map<std::string, std::optional<ForceSensorData>> get_latest_data() const;
+  FingerArray<std::optional<ForceSensorData>> get_latest_data() const;
 
  private:
   struct Impl;

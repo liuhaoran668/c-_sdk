@@ -9,21 +9,11 @@
 #include <mutex>
 #include <optional>
 #include <stdexcept>
-#include <type_traits>
+#include <utility>
 
 #include "linkerhand/exceptions.hpp"
 
 namespace linkerhand {
-
-class QueueEmpty : public std::runtime_error {
- public:
-  QueueEmpty() : std::runtime_error("Queue is empty") {}
-};
-
-class QueueFull : public std::runtime_error {
- public:
-  QueueFull() : std::runtime_error("Queue is full") {}
-};
 
 class StopIteration : public std::runtime_error {
  public:
@@ -48,17 +38,48 @@ class IterableQueue {
   explicit IterableQueue(std::size_t maxsize = 0)
       : state_(std::make_shared<State>(maxsize)) {}
 
-  void put(const T& item, bool block = true, std::optional<double> timeout_s = std::nullopt) {
-    put_impl(state_, item, block, timeout_s);
+  /// Blocking put. Waits until space is available. Throws StateError if closed.
+  void put(const T& item) { put_blocking(state_, item); }
+  void put(T&& item) { put_blocking(state_, std::move(item)); }
+
+  /// Non-blocking put. Returns false if queue is full or closed.
+  bool try_put(const T& item) { return try_put_impl(state_, item); }
+  bool try_put(T&& item) { return try_put_impl(state_, std::move(item)); }
+
+  /// Drops the oldest item if the queue is full. Returns false only if the queue is closed.
+  bool force_put(T item) {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    if (state_->closed) {
+      return false;
+    }
+    const bool bounded = state_->maxsize > 0;
+    if (bounded && state_->queue.size() >= state_->maxsize) {
+      state_->queue.pop_front();
+    }
+    state_->queue.push_back(std::move(item));
+    state_->cv_not_empty.notify_one();
+    return true;
   }
 
-  void put_nowait(const T& item) { put(item, /*block=*/false, std::nullopt); }
+  /// Blocking get. Waits until an item is available. Throws StopIteration if closed and empty.
+  T get() { return get_blocking(state_); }
 
-  T get(bool block = true, std::optional<double> timeout_s = std::nullopt) {
-    return get_impl(state_, block, timeout_s);
+  /// Blocking get with timeout. Returns nullopt on timeout. Throws StopIteration if closed and empty.
+  std::optional<T> get_for(std::chrono::milliseconds timeout) {
+    return get_timed(state_, timeout);
   }
 
-  T get_nowait() { return get(/*block=*/false, std::nullopt); }
+  /// Non-blocking get. Returns nullopt if empty.
+  std::optional<T> try_get() {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    if (state_->queue.empty()) {
+      return std::nullopt;
+    }
+    T item = std::move(state_->queue.front());
+    state_->queue.pop_front();
+    state_->cv_not_full.notify_one();
+    return item;
+  }
 
   bool empty() const {
     std::lock_guard<std::mutex> lock(state_->mutex);
@@ -113,7 +134,7 @@ class IterableQueue {
       }
 
       try {
-        current_ = get_impl(state_, /*block=*/true, std::nullopt);
+        current_ = get_blocking(state_);
       } catch (const StopIteration&) {
         state_.reset();
         current_.reset();
@@ -131,90 +152,73 @@ class IterableQueue {
   Iterator end() const { return Iterator(); }
 
  private:
-  static void put_impl(
-      const std::shared_ptr<State>& state,
-      const T& item,
-      bool block,
-      const std::optional<double>& timeout_s) {
+  template <typename U>
+  static void put_blocking(const std::shared_ptr<State>& state, U&& item) {
     std::unique_lock<std::mutex> lock(state->mutex);
     if (state->closed) {
       throw StateError("Cannot put to a closed queue");
     }
 
     const bool bounded = state->maxsize > 0;
-    if (!bounded) {
-      state->queue.push_back(item);
+    if (!bounded || state->queue.size() < state->maxsize) {
+      state->queue.push_back(std::forward<U>(item));
       lock.unlock();
       state->cv_not_empty.notify_one();
       return;
     }
 
-    auto has_space = [&]() { return state->queue.size() < state->maxsize; };
-    if (has_space()) {
-      state->queue.push_back(item);
-      lock.unlock();
-      state->cv_not_empty.notify_one();
-      return;
-    }
-
-    if (!block) {
-      throw QueueFull();
-    }
-
-    auto has_space_or_closed = [&]() { return has_space() || state->closed; };
-
-    if (timeout_s.has_value()) {
-      const auto timeout =
-          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-              std::chrono::duration<double>(*timeout_s));
-      if (!state->cv_not_full.wait_for(lock, timeout, has_space_or_closed)) {
-        throw QueueFull();
-      }
-    } else {
-      state->cv_not_full.wait(lock, has_space_or_closed);
-    }
+    state->cv_not_full.wait(lock, [&] { return state->queue.size() < state->maxsize || state->closed; });
 
     if (state->closed) {
       throw StateError("Cannot put to a closed queue");
     }
 
-    state->queue.push_back(item);
+    state->queue.push_back(std::forward<U>(item));
     lock.unlock();
     state->cv_not_empty.notify_one();
   }
 
-  static T get_impl(
-      const std::shared_ptr<State>& state,
-      bool block,
-      const std::optional<double>& timeout_s) {
+  template <typename U>
+  static bool try_put_impl(const std::shared_ptr<State>& state, U&& item) {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->closed) {
+      return false;
+    }
+    const bool bounded = state->maxsize > 0;
+    if (bounded && state->queue.size() >= state->maxsize) {
+      return false;
+    }
+    state->queue.push_back(std::forward<U>(item));
+    state->cv_not_empty.notify_one();
+    return true;
+  }
+
+  static T get_blocking(const std::shared_ptr<State>& state) {
+    std::unique_lock<std::mutex> lock(state->mutex);
+    state->cv_not_empty.wait(lock, [&] { return !state->queue.empty() || state->closed; });
+
+    if (state->queue.empty()) {
+      throw StopIteration();
+    }
+
+    T item = std::move(state->queue.front());
+    state->queue.pop_front();
+    lock.unlock();
+    state->cv_not_full.notify_one();
+    return item;
+  }
+
+  static std::optional<T> get_timed(const std::shared_ptr<State>& state,
+                                    std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lock(state->mutex);
 
     if (state->closed && state->queue.empty()) {
       throw StopIteration();
     }
 
-    auto has_item_or_closed = [&]() { return !state->queue.empty() || state->closed; };
-
-    if (!block) {
-      if (state->queue.empty()) {
-        throw QueueEmpty();
-      }
-      T item = std::move(state->queue.front());
-      state->queue.pop_front();
-      lock.unlock();
-      state->cv_not_full.notify_one();
-      return item;
-    }
-
-    if (timeout_s.has_value()) {
-      const auto timeout =
-          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-              std::chrono::duration<double>(*timeout_s));
-      if (!state->cv_not_empty.wait_for(lock, timeout, has_item_or_closed)) {
-        throw QueueEmpty();
-      }
-    } else {
-      state->cv_not_empty.wait(lock, has_item_or_closed);
+    if (!state->cv_not_empty.wait_for(lock, timeout,
+                                       [&] { return !state->queue.empty() || state->closed; })) {
+      return std::nullopt;
     }
 
     if (state->closed && state->queue.empty()) {
@@ -222,7 +226,7 @@ class IterableQueue {
     }
 
     if (state->queue.empty()) {
-      throw QueueEmpty();
+      return std::nullopt;
     }
 
     T item = std::move(state->queue.front());

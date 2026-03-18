@@ -19,17 +19,10 @@
 
 namespace linkerhand {
 
-CANMessageDispatcher::CANMessageDispatcher(
-    const std::string& interface_name,
-    const std::string& interface_type)
-    : interface_name_(interface_name), interface_type_(interface_type) {
-  if (interface_type_ != "socketcan") {
-    throw ValidationError("Only 'socketcan' interface_type is supported");
-  }
-
+CANMessageDispatcher::CANMessageDispatcher(std::string interface_name)
+    : interface_name_(std::move(interface_name)) {
 #ifndef __linux__
-  (void)interface_name_;
-  throw CANError("SocketCAN backend is only supported on Linux");
+  throw CANError("SocketCAN is only supported on Linux");
 #else
   socket_fd_ = ::socket(PF_CAN, SOCK_RAW, CAN_RAW);
   if (socket_fd_ < 0) {
@@ -97,7 +90,7 @@ void CANMessageDispatcher::unsubscribe(std::size_t subscription_id) {
 void CANMessageDispatcher::send(const CanMessage& msg) {
 #ifndef __linux__
   (void)msg;
-  throw CANError("SocketCAN backend is only supported on Linux");
+  throw CANError("SocketCAN is only supported on Linux");
 #else
   std::lock_guard<std::mutex> lock(socket_mutex_);
   if (socket_fd_ < 0) {
@@ -114,7 +107,7 @@ void CANMessageDispatcher::send(const CanMessage& msg) {
   } else {
     frame.can_id &= CAN_SFF_MASK;
   }
-  frame.can_dlc = static_cast<__u8>(msg.dlc);
+  frame.can_dlc = msg.dlc;
   for (std::size_t i = 0; i < msg.dlc; ++i) {
     frame.data[i] = msg.data[i];
   }
@@ -153,7 +146,7 @@ void CANMessageDispatcher::recv_loop() {
   pfd.fd = socket_fd_;
   pfd.events = POLLIN;
 
-  while (running_.load()) {
+  while (running_.load(std::memory_order_acquire)) {
     const int ret = ::poll(&pfd, 1, 10);
     if (ret < 0) {
       if (errno == EINTR) {
@@ -187,7 +180,7 @@ void CANMessageDispatcher::recv_loop() {
     msg.arbitration_id =
         msg.is_extended_id ? (frame.can_id & CAN_EFF_MASK) : (frame.can_id & CAN_SFF_MASK);
     msg.dlc = frame.can_dlc;
-    for (std::size_t i = 0; i < msg.dlc && i < msg.data.size(); ++i) {
+    for (std::uint8_t i = 0; i < msg.dlc && i < msg.data.size(); ++i) {
       msg.data[i] = frame.data[i];
     }
 

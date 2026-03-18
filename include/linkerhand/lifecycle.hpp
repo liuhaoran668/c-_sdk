@@ -49,18 +49,16 @@ class Lifecycle {
   void ensure_open() const {
     std::lock_guard<std::mutex> lock(mutex_);
     if (state_ != LifecycleState::Open) {
-      throw StateError(owner_name_ + " interface is closed. Create a new instance or use context manager.");
+      throw StateError(owner_name_ + " is closed; create a new instance to continue");
     }
   }
 
-  /// Single atomic close operation: sets state to Closed and notifies all subscribers.
-  /// Idempotent: returns false if already closed, true if this call performed the close.
   bool close() {
     std::vector<std::shared_ptr<Subscription>> subscriptions;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (state_ == LifecycleState::Closed) {
-        return false;  // Already closed
+        return false;
       }
       state_ = LifecycleState::Closed;
       notification_count_ += 1;
@@ -73,10 +71,7 @@ class Lifecycle {
 
     cv_.notify_all();
     for (const auto& sub : subscriptions) {
-      if (!sub) {
-        continue;
-      }
-      if (!sub->active.load()) {
+      if (!sub || !sub->active.load()) {
         continue;
       }
       try {
@@ -92,20 +87,14 @@ class Lifecycle {
     return notification_count_;
   }
 
-  bool wait_for_notification(std::uint64_t last_notification_count, double timeout_ms) const {
-    if (timeout_ms < 0) {
-      throw ValidationError("timeout_ms must be non-negative");
-    }
-
+  bool wait_for_notification(std::uint64_t last_notification_count,
+                             std::chrono::milliseconds timeout) const {
     std::unique_lock<std::mutex> lock(mutex_);
     auto pred = [&] { return notification_count_ != last_notification_count || state_ != LifecycleState::Open; };
-    if (timeout_ms == 0) {
+    if (timeout == std::chrono::milliseconds::zero()) {
       return pred();
     }
 
-    const auto timeout =
-        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-            std::chrono::duration<double, std::milli>(timeout_ms));
     return cv_.wait_for(lock, timeout, pred);
   }
 
