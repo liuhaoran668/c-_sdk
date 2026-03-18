@@ -32,30 +32,30 @@ scripts/setup_can.sh can0 1000000
 ### 目录结构
 ```
 include/linkerhand/
-├── linkerhand.hpp          # 统一入口
-├── can_dispatcher.hpp      # CAN 消息调度器
-├── lifecycle.hpp           # 生命周期管理
-├── exceptions.hpp          # 异常类型
-├── iterable_queue.hpp      # 线程安全阻塞队列
-└── hand/l6/                # L6 手型模块
-    ├── l6.hpp              # Facade 类
-    ├── angle_manager.hpp   # 角度管理
-    └── force_sensor_manager.hpp  # 力传感器
+├── linkerhand.hpp           # 统一入口
+├── can_dispatcher.hpp       # CAN 消息调度器
+├── lifecycle.hpp            # 生命周期管理
+├── exceptions.hpp           # 异常类型
+├── iterable_queue.hpp       # 线程安全阻塞队列
+└── hand/l6/                 # L6 手型模块
+    ├── l6.hpp               # Facade 类
+    ├── angle_manager.hpp    # 角度管理
+    └── force_sensor_manager.hpp  # 力传感器 (含 Finger 枚举)
 
 src/
 ├── can_dispatcher.cpp
 └── hand/
-    ├── common.hpp          # 内部共享工具
+    ├── common.hpp           # 内部共享工具
     └── l6/*.cpp
 ```
 
 ### 核心组件关系
 ```
 L6 (Facade)
-├── CANMessageDispatcher  (CAN 消息收发，单 recv 线程)
-├── Lifecycle             (共享生命周期状态 Open/Closed)
-├── AngleManager          (角度控制/查询)
-└── ForceSensorManager    (力传感器数据采集)
+├── CANMessageDispatcher (CAN 消息收发，单 recv 线程)
+├── Lifecycle (共享生命周期状态 Open/Closed)
+├── AngleManager (角度控制/查询)
+└── ForceSensorManager (力传感器数据采集)
 ```
 
 ### 线程模型
@@ -67,6 +67,14 @@ L6 (Facade)
 - **Pimpl**: Manager 使用 Pimpl 隐藏实现
 - **订阅者快照分发**: recv_loop 复制订阅者列表后释放锁，允许回调中安全调用 subscribe/unsubscribe
 - **架构保证安全退订**: `stop()` join `recv_thread_` 后 Manager 才析构，无需复杂同步机制
+
+### 关键 C++ 惯用法
+- **`std::chrono`**: 所有超时/间隔参数使用 `std::chrono::milliseconds`，支持 `100ms` 字面量
+- **`enum class Finger`**: 类型安全的手指枚举，替代字符串键
+- **`FingerArray<T>`**: `std::array<T, 5>` 别名，替代 `unordered_map<string, T>`
+- **`force_put()`**: 队列满时丢弃最旧元素，用返回值替代异常流控
+- **`std::async` 并发**: 多指阻塞查询并发执行，共享 deadline
+- **原地 FrameBatch**: 避免 Python 式不可变拷贝开销
 
 ## 代码风格
 

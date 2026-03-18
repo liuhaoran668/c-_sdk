@@ -18,3 +18,6 @@ target_link_libraries(linkerhand_cpp_sdk PRIVATE Threads::Threads)
 # 测试程序
 # ============================================================================
 
+add_executable(test_compile tests/test_compile.cpp)
+target_link_libraries(test_compile PRIVATE linkerhand_cpp_sdk Threads::Threads)
+
